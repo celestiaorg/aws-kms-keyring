@@ -114,6 +114,26 @@ func wrapKeyMaterial(keyMaterial []byte, wrappingKey []byte) ([]byte, error) {
 	return encrypted, nil
 }
 
+// importKeyIfNeeded handles idempotent key import during keyring initialization.
+// If the key already exists, it's skipped. If it doesn't exist, it's imported.
+func (k *kmsKeyring) importKeyIfNeeded(keyName, keyHex string) error {
+	// Check if key already exists
+	_, err := k.getRecord(keyName)
+	if err == nil {
+		// Key exists, skip import (idempotent behavior)
+		return nil
+	}
+	if errors.Is(err, sdkerrors.ErrKeyNotFound) {
+		// Key doesn't exist, import it
+		if err := k.ImportPrivKeyHex(keyName, keyHex, "secp256k1"); err != nil {
+			return fmt.Errorf("import key %q: %w", keyName, err)
+		}
+		return nil
+	}
+	// Other error occurred while checking key existence
+	return fmt.Errorf("check key existence %q: %w", keyName, err)
+}
+
 // NewKMSKeyring creates a new AWS KMS-backed keyring.
 // The provided context is used for KMS operations.
 // If defaultKey is specified, it will validate that the key exists.
@@ -129,26 +149,25 @@ func NewKMSKeyring(ctx context.Context, defaultKey string, cfg Config) (keyring.
 	loadOpts := []func(*awsconfig.LoadOptions) error{
 		awsconfig.WithRegion(cfg.Region),
 	}
-	if cfg.Endpoint != "" {
-		resolver := aws.EndpointResolverWithOptionsFunc(
-			func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-				if service == kms.ServiceID {
-					return aws.Endpoint{URL: cfg.Endpoint, HostnameImmutable: true}, nil
-				}
-				return aws.Endpoint{}, &aws.EndpointNotFoundError{}
-			},
-		)
-		loadOpts = append(loadOpts, awsconfig.WithEndpointResolverWithOptions(resolver))
-	}
 
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("load aws config: %w", err)
 	}
 
+	// Create KMS client with optional custom endpoint
+	var kmsClient *kms.Client
+	if cfg.Endpoint != "" {
+		kmsClient = kms.NewFromConfig(awsCfg, func(o *kms.Options) {
+			o.BaseEndpoint = aws.String(cfg.Endpoint)
+		})
+	} else {
+		kmsClient = kms.NewFromConfig(awsCfg)
+	}
+
 	k := &kmsKeyring{
 		ctx:         ctx,
-		client:      kms.NewFromConfig(awsCfg),
+		client:      kmsClient,
 		aliasPrefix: aliasPrefix,
 		records:     make(map[string]*kmsCachedRecord),
 		addrLookup:  make(map[string]string),
@@ -156,18 +175,8 @@ func NewKMSKeyring(ctx context.Context, defaultKey string, cfg Config) (keyring.
 
 	// Handle key import if specified in config
 	if cfg.ImportKeyName != "" && cfg.ImportKeyHex != "" {
-		// Check if key already exists
-		_, err := k.getRecord(cfg.ImportKeyName)
-		if err == nil {
-			// Key exists, skip import (idempotent behavior)
-		} else if errors.Is(err, sdkerrors.ErrKeyNotFound) {
-			// Key doesn't exist, import it
-			if err := k.ImportPrivKeyHex(cfg.ImportKeyName, cfg.ImportKeyHex, "secp256k1"); err != nil {
-				return nil, fmt.Errorf("import key %q: %w", cfg.ImportKeyName, err)
-			}
-		} else {
-			// Other error occurred while checking key existence
-			return nil, fmt.Errorf("check key existence %q: %w", cfg.ImportKeyName, err)
+		if err := k.importKeyIfNeeded(cfg.ImportKeyName, cfg.ImportKeyHex); err != nil {
+			return nil, err
 		}
 	}
 
@@ -336,7 +345,7 @@ func (k *kmsKeyring) Delete(string) error               { return errUnsupportedK
 func (k *kmsKeyring) DeleteByAddress(sdk.Address) error { return errUnsupportedKMSOp }
 func (k *kmsKeyring) Rename(string, string) error       { return errUnsupportedKMSOp }
 
-func (k *kmsKeyring) NewMnemonic(uid string, language keyring.Language, hdPath, bip39Passphrase string, algo keyring.SignatureAlgo) (*keyring.Record, string, error) {
+func (k *kmsKeyring) NewMnemonic(uid string, _ keyring.Language, _, _ string, algo keyring.SignatureAlgo) (*keyring.Record, string, error) {
 	// Validate algorithm
 	if algo != hd.Secp256k1 {
 		return nil, "", fmt.Errorf("kms: only secp256k1 supported, got %s", algo)
@@ -390,7 +399,7 @@ func (k *kmsKeyring) SaveMultisig(string, cryptotypes.PubKey) (*keyring.Record, 
 	return nil, errUnsupportedKMSOp
 }
 
-func (k *kmsKeyring) Sign(uid string, msg []byte, signMode signing.SignMode) ([]byte, cryptotypes.PubKey, error) {
+func (k *kmsKeyring) Sign(uid string, msg []byte, _ signing.SignMode) ([]byte, cryptotypes.PubKey, error) {
 	cached, err := k.getRecord(uid)
 	if err != nil {
 		return nil, nil, err
@@ -447,7 +456,7 @@ func derSignatureToSecp(der []byte) ([]byte, error) {
 	return result, nil
 }
 
-func (k *kmsKeyring) ImportPrivKey(uid string, armor string, passphrase string) error {
+func (k *kmsKeyring) ImportPrivKey(_ string, _ string, _ string) error {
 	return fmt.Errorf("kms: armored import not supported, use ImportPrivKeyHex for hex-encoded keys")
 }
 
