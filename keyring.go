@@ -28,7 +28,6 @@ import (
 	"github.com/cosmos/cosmos-sdk/types/tx/signing"
 	dcrsecp256k1 "github.com/decred/dcrd/dcrec/secp256k1/v4"
 	secp256k1ecdsa "github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
-	"github.com/ethereum/go-ethereum/log"
 )
 
 var (
