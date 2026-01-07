@@ -450,7 +450,6 @@ func derSignatureToSecp(der []byte) ([]byte, error) {
 	// Normalize S to low-S form (BIP 62) if needed
 	// This is required for Cosmos signature verification
 	if s.IsOverHalfOrder() {
-		log.Debug("AWS KMS signature: normalizing high-S to low-S for BIP 62 compliance")
 		s = *new(dcrsecp256k1.ModNScalar).NegateVal(&s)
 	}
 
