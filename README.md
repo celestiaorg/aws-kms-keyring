@@ -52,7 +52,7 @@ config := awskeyring.Config{
     Region:        "us-west-2",
     AliasPrefix:   "alias/myapp/",
     ImportKeyName: "my-key",
-    ImportKeyHex:  "0x1234567890abcdef...", // Your hex-encoded private key
+    ImportKeyHex:  "1234567890abcdef...", // Your hex-encoded private key
 }
 
 kr, err := awskeyring.NewKMSKeyring(ctx, "my-key", config)
