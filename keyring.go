@@ -26,7 +26,9 @@ import (
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
 	"github.com/cosmos/cosmos-sdk/types/tx/signing"
+	dcrsecp256k1 "github.com/decred/dcrd/dcrec/secp256k1/v4"
 	secp256k1ecdsa "github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
+	"github.com/ethereum/go-ethereum/log"
 )
 
 var (
@@ -442,16 +444,25 @@ func derSignatureToSecp(der []byte) ([]byte, error) {
 		return nil, fmt.Errorf("parse der signature: %w", err)
 	}
 
-	// Extract R and S as 32-byte arrays (automatically normalized to low-S by ParseDERSignature)
+	// Extract R and S values
 	r := sig.R()
 	s := sig.S()
+
+	// Normalize S to low-S form (BIP 62) if needed
+	// This is required for Cosmos signature verification
+	if s.IsOverHalfOrder() {
+		log.Debug("AWS KMS signature: normalizing high-S to low-S for BIP 62 compliance")
+		s = *new(dcrsecp256k1.ModNScalar).NegateVal(&s)
+	}
+
+	// Convert to 32-byte arrays
 	rBytes := r.Bytes()
 	sBytes := s.Bytes()
 
 	// Concatenate R and S to create the 64-byte signature format expected by Cosmos
-	result := make([]byte, 0, 64)
-	result = append(result, rBytes[:]...)
-	result = append(result, sBytes[:]...)
+	result := make([]byte, 64)
+	copy(result[:32], rBytes[:])
+	copy(result[32:], sBytes[:])
 
 	return result, nil
 }
