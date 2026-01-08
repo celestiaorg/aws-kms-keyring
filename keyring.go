@@ -43,12 +43,16 @@ type Config struct {
 	// Import configuration - specify a key to import on startup
 	ImportKeyName string
 	ImportKeyHex  string
+
+	// AutoCreate enables automatic creation of missing keys
+	AutoCreate bool
 }
 
 type kmsKeyring struct {
 	ctx         context.Context
 	client      *kms.Client
 	aliasPrefix string
+	config      Config
 
 	mu         sync.RWMutex
 	records    map[string]*kmsCachedRecord
@@ -170,6 +174,7 @@ func NewKMSKeyring(ctx context.Context, defaultKey string, cfg Config) (keyring.
 		ctx:         ctx,
 		client:      kmsClient,
 		aliasPrefix: aliasPrefix,
+		config:      cfg,
 		records:     make(map[string]*kmsCachedRecord),
 		addrLookup:  make(map[string]string),
 	}
@@ -185,7 +190,8 @@ func NewKMSKeyring(ctx context.Context, defaultKey string, cfg Config) (keyring.
 		return nil, err
 	}
 
-	if defaultKey != "" {
+	// Only validate default key existence if auto-create is disabled
+	if defaultKey != "" && !cfg.AutoCreate {
 		if _, err := k.getRecord(defaultKey); err != nil {
 			return nil, fmt.Errorf("kms key %q not found: %w", defaultKey, err)
 		}
@@ -324,22 +330,45 @@ func (k *kmsKeyring) KeyByAddress(address sdk.Address) (*keyring.Record, error) 
 }
 
 func (k *kmsKeyring) getRecord(name string) (*kmsCachedRecord, error) {
+	// Check cache
 	k.mu.RLock()
 	cached, ok := k.records[name]
 	k.mu.RUnlock()
 	if ok {
 		return cached, nil
 	}
+
+	// Refresh cache from KMS
 	if err := k.refreshCache(); err != nil {
 		return nil, err
 	}
+
+	// Check cache again
 	k.mu.RLock()
 	cached, ok = k.records[name]
 	k.mu.RUnlock()
-	if !ok {
-		return nil, sdkerrors.ErrKeyNotFound
+	if ok {
+		return cached, nil
 	}
-	return cached, nil
+
+	// Auto-create if enabled
+	if k.config.AutoCreate {
+		newRec, err := k.createKeyInKMS(name)
+		if err != nil {
+			return nil, fmt.Errorf("failed to auto-create key %q: %w", name, err)
+		}
+
+		// Cache the newly created key
+		addr := sdk.AccAddress(newRec.pub.Address()).String()
+		k.mu.Lock()
+		k.records[name] = newRec
+		k.addrLookup[addr] = name
+		k.mu.Unlock()
+
+		return newRec, nil
+	}
+
+	return nil, sdkerrors.ErrKeyNotFound
 }
 
 func (k *kmsKeyring) Delete(string) error               { return errUnsupportedKMSOp }
@@ -352,39 +381,49 @@ func (k *kmsKeyring) NewMnemonic(uid string, _ keyring.Language, _, _ string, al
 		return nil, "", fmt.Errorf("kms: only secp256k1 supported, got %s", algo)
 	}
 
+	// Reuse the creation logic
+	cached, err := k.createKeyInKMS(uid)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Cache the newly created key
+	addr := sdk.AccAddress(cached.pub.Address()).String()
+	k.mu.Lock()
+	k.records[uid] = cached
+	k.addrLookup[addr] = uid
+	k.mu.Unlock()
+
+	// Return empty mnemonic (not applicable for KMS-managed keys)
+	return cached.rec, "", nil
+}
+
+// createKeyInKMS creates a new secp256k1 key in KMS and creates an alias for it
+func (k *kmsKeyring) createKeyInKMS(name string) (*kmsCachedRecord, error) {
 	// Create key in KMS
 	createResp, err := k.client.CreateKey(k.ctx, &kms.CreateKeyInput{
 		KeySpec:     kmstypes.KeySpecEccSecgP256k1,
 		KeyUsage:    kmstypes.KeyUsageTypeSignVerify,
-		Description: aws.String(fmt.Sprintf("Celestia account: %s", uid)),
+		Description: aws.String(fmt.Sprintf("Celestia account: %s", name)),
 	})
 	if err != nil {
-		return nil, "", fmt.Errorf("kms create key: %w", err)
+		return nil, fmt.Errorf("failed to create KMS key: %w", err)
 	}
+
+	keyID := *createResp.KeyMetadata.KeyId
 
 	// Create alias
-	aliasName := k.aliasPrefix + uid
+	aliasName := k.aliasPrefix + name
 	_, err = k.client.CreateAlias(k.ctx, &kms.CreateAliasInput{
 		AliasName:   aws.String(aliasName),
-		TargetKeyId: createResp.KeyMetadata.KeyId,
+		TargetKeyId: aws.String(keyID),
 	})
 	if err != nil {
-		return nil, "", fmt.Errorf("kms create alias: %w", err)
+		return nil, fmt.Errorf("failed to create alias: %w", err)
 	}
 
-	// Refresh cache to pick up new key
-	if err := k.refreshCache(); err != nil {
-		return nil, "", err
-	}
-
-	// Get the record
-	rec, err := k.Key(uid)
-	if err != nil {
-		return nil, "", err
-	}
-
-	// Return empty mnemonic (not applicable for KMS-managed keys)
-	return rec, "", nil
+	// Build and return the record
+	return k.buildRecord(name, keyID)
 }
 
 func (k *kmsKeyring) NewAccount(string, string, string, string, keyring.SignatureAlgo) (*keyring.Record, error) {
