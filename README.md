@@ -96,6 +96,15 @@ type Config struct {
 
 The library implements the full `keyring.Keyring` interface:
 
+### Implementation Approach
+
+This library works around the Cosmos SDK keyring interface to support operations compatible with AWS KMS capabilities. Key implementation details:
+
+- **No BIP 39 Mnemonic Support**: AWS KMS does not support BIP 39-style hierarchically deterministic wallets with mnemonics. When `NewMnemonic()` is called, the library creates a new keypair in KMS instead of deriving from a mnemonic.
+- **Alias Mapping**: Key names are mapped to KMS aliases (e.g., `my-key` becomes `alias/op-alt-da/my-key`) for human-readable identification.
+- **Minimal Implementation**: The library implements just enough methods to support [op-alt-da](https://github.com/celestiaorg/op-alt-da), focusing on key signing and management operations that KMS can provide.
+- **KMS-First Design**: Operations that require exporting or manipulating private keys locally are intentionally unsupported, as they would defeat the purpose of using KMS for secure key management.
+
 ### Supported Operations
 
 - ✅ `Backend()` - Returns "kms"
