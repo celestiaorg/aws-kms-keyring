@@ -2,16 +2,8 @@ package awskeyring
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/sha256"
-	"crypto/x509"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"sort"
-	"strings"
-	"sync"
 
 	secp256k1x509 "github.com/MetaMask/go-did-it/crypto/secp256k1"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -30,137 +22,40 @@ import (
 	secp256k1ecdsa "github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 )
 
-var (
-	errUnsupportedKMSOp = errors.New("kms keyring: operation not supported")
-)
+var errUnsupportedKMSOp = errors.New("kms keyring: operation not supported")
 
-// Config configures an AWS KMS-backed keyring using aliases.
+// Config configures an AWS KMS-backed keyring with a single key.
 type Config struct {
-	Region      string
-	Endpoint    string
-	AliasPrefix string
-
-	// Import configuration - specify a key to import on startup
-	ImportKeyName string
-	ImportKeyHex  string
-
-	// AutoCreate enables automatic creation of missing keys
-	AutoCreate bool
+	Region   string
+	Endpoint string
+	KeyName  string // The KMS key alias (e.g., "alias/my-key")
 }
 
 type kmsKeyring struct {
-	ctx         context.Context
-	client      *kms.Client
-	aliasPrefix string
-	config      Config
+	ctx    context.Context
+	client *kms.Client
+	config Config
 
-	mu         sync.RWMutex
-	records    map[string]*kmsCachedRecord
-	addrLookup map[string]string
+	keyID  string
+	record *keyring.Record
+	pubKey cryptotypes.PubKey
+	addr   string
 }
 
-type kmsCachedRecord struct {
-	keyID string
-	rec   *keyring.Record
-	pub   cryptotypes.PubKey
-}
-
-// hexToPrivateKey converts hex-encoded private key to PKCS#8 DER format
-func hexToPrivateKey(privKeyHex string) ([]byte, error) {
-	// Strip 0x prefix if present
-	privKeyHex = strings.TrimPrefix(privKeyHex, "0x")
-
-	// Decode hex to bytes
-	privKeyBytes, err := hex.DecodeString(privKeyHex)
-	if err != nil {
-		return nil, fmt.Errorf("decode hex: %w", err)
-	}
-
-	// Validate length (32 bytes for secp256k1)
-	if len(privKeyBytes) != 32 {
-		return nil, fmt.Errorf("invalid key length: got %d bytes, expected 32", len(privKeyBytes))
-	}
-
-	// Convert to MetaMask PrivateKey
-	privKey, err := secp256k1x509.PrivateKeyFromBytes(privKeyBytes)
-	if err != nil {
-		return nil, fmt.Errorf("create private key: %w", err)
-	}
-
-	// Convert to PKCS#8 DER format
-	return privKey.ToPKCS8DER(), nil
-}
-
-// wrapKeyMaterial encrypts key material for KMS import
-func wrapKeyMaterial(keyMaterial []byte, wrappingKey []byte) ([]byte, error) {
-	// Parse RSA public key from wrapping key
-	pubKeyInterface, err := x509.ParsePKIXPublicKey(wrappingKey)
-	if err != nil {
-		return nil, fmt.Errorf("parse wrapping key: %w", err)
-	}
-
-	rsaPubKey, ok := pubKeyInterface.(*rsa.PublicKey)
-	if !ok {
-		return nil, fmt.Errorf("wrapping key is not RSA")
-	}
-
-	// Encrypt using RSA-OAEP with SHA-256
-	encrypted, err := rsa.EncryptOAEP(
-		sha256.New(),
-		rand.Reader,
-		rsaPubKey,
-		keyMaterial,
-		nil,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("encrypt key material: %w", err)
-	}
-
-	return encrypted, nil
-}
-
-// importKeyIfNeeded handles idempotent key import during keyring initialization.
-// If the key already exists, it's skipped. If it doesn't exist, it's imported.
-func (k *kmsKeyring) importKeyIfNeeded(keyName, keyHex string) error {
-	// Check if key already exists
-	_, err := k.getRecord(keyName)
-	if err == nil {
-		// Key exists, skip import (idempotent behavior)
-		return nil
-	}
-	if errors.Is(err, sdkerrors.ErrKeyNotFound) {
-		// Key doesn't exist, import it
-		if err := k.ImportPrivKeyHex(keyName, keyHex, "secp256k1"); err != nil {
-			return fmt.Errorf("import key %q: %w", keyName, err)
-		}
-		return nil
-	}
-	// Other error occurred while checking key existence
-	return fmt.Errorf("check key existence %q: %w", keyName, err)
-}
-
-// NewKMSKeyring creates a new AWS KMS-backed keyring.
-// The provided context is used for KMS operations.
-// If defaultKey is specified, it will validate that the key exists.
-func NewKMSKeyring(ctx context.Context, defaultKey string, cfg Config) (keyring.Keyring, error) {
+// NewKMSKeyring creates a new AWS KMS-backed keyring with a single configured key.
+func NewKMSKeyring(ctx context.Context, cfg Config) (keyring.Keyring, error) {
 	if cfg.Region == "" {
 		return nil, fmt.Errorf("kms region is required")
 	}
-	aliasPrefix := cfg.AliasPrefix
-	if aliasPrefix == "" {
-		aliasPrefix = "alias/op-alt-da/"
+	if cfg.KeyName == "" {
+		return nil, fmt.Errorf("kms key name is required")
 	}
 
-	loadOpts := []func(*awsconfig.LoadOptions) error{
-		awsconfig.WithRegion(cfg.Region),
-	}
-
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.Region))
 	if err != nil {
 		return nil, fmt.Errorf("load aws config: %w", err)
 	}
 
-	// Create KMS client with optional custom endpoint
 	var kmsClient *kms.Client
 	if cfg.Endpoint != "" {
 		kmsClient = kms.NewFromConfig(awsCfg, func(o *kms.Options) {
@@ -171,109 +66,46 @@ func NewKMSKeyring(ctx context.Context, defaultKey string, cfg Config) (keyring.
 	}
 
 	k := &kmsKeyring{
-		ctx:         ctx,
-		client:      kmsClient,
-		aliasPrefix: aliasPrefix,
-		config:      cfg,
-		records:     make(map[string]*kmsCachedRecord),
-		addrLookup:  make(map[string]string),
+		ctx:    ctx,
+		client: kmsClient,
+		config: cfg,
 	}
 
-	// Handle key import if specified in config
-	if cfg.ImportKeyName != "" && cfg.ImportKeyHex != "" {
-		if err := k.importKeyIfNeeded(cfg.ImportKeyName, cfg.ImportKeyHex); err != nil {
-			return nil, err
-		}
-	}
-
-	if err := k.refreshCache(); err != nil {
+	if err := k.loadKey(); err != nil {
 		return nil, err
-	}
-
-	// Only validate default key existence if auto-create is disabled
-	if defaultKey != "" && !cfg.AutoCreate {
-		if _, err := k.getRecord(defaultKey); err != nil {
-			return nil, fmt.Errorf("kms key %q not found: %w", defaultKey, err)
-		}
 	}
 
 	return k, nil
 }
 
-func (k *kmsKeyring) refreshCache() error {
-	aliases, err := k.listAliases()
+func (k *kmsKeyring) loadKey() error {
+	pkResp, err := k.client.GetPublicKey(k.ctx, &kms.GetPublicKeyInput{
+		KeyId: aws.String(k.config.KeyName),
+	})
 	if err != nil {
-		return err
-	}
-
-	newRecords := make(map[string]*kmsCachedRecord)
-	newAddrIndex := make(map[string]string)
-
-	for _, alias := range aliases {
-		if alias.AliasName == nil || alias.TargetKeyId == nil {
-			continue
-		}
-		aliasName := aws.ToString(alias.AliasName)
-		if !strings.HasPrefix(aliasName, k.aliasPrefix) {
-			continue
-		}
-		keyName := strings.TrimPrefix(aliasName, k.aliasPrefix)
-		cached, err := k.buildRecord(keyName, aws.ToString(alias.TargetKeyId))
-		if err != nil {
-			return fmt.Errorf("build record %s: %w", keyName, err)
-		}
-
-		addr := sdk.AccAddress(cached.pub.Address()).String()
-		newRecords[keyName] = cached
-		newAddrIndex[addr] = keyName
-	}
-
-	k.mu.Lock()
-	k.records = newRecords
-	k.addrLookup = newAddrIndex
-	k.mu.Unlock()
-
-	return nil
-}
-
-func (k *kmsKeyring) listAliases() ([]kmstypes.AliasListEntry, error) {
-	paginator := kms.NewListAliasesPaginator(k.client, &kms.ListAliasesInput{})
-	var aliases []kmstypes.AliasListEntry
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(k.ctx)
-		if err != nil {
-			return nil, fmt.Errorf("list aliases: %w", err)
-		}
-		aliases = append(aliases, page.Aliases...)
-	}
-	return aliases, nil
-}
-
-func (k *kmsKeyring) buildRecord(name, keyID string) (*kmsCachedRecord, error) {
-	pkResp, err := k.client.GetPublicKey(k.ctx, &kms.GetPublicKeyInput{KeyId: aws.String(keyID)})
-	if err != nil {
-		return nil, fmt.Errorf("get public key: %w", err)
+		return fmt.Errorf("get public key: %w", err)
 	}
 
 	pubKey, err := kmsPubKeyToCosmos(pkResp.PublicKey)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	anyPub, err := types.NewAnyWithValue(pubKey)
 	if err != nil {
-		return nil, fmt.Errorf("pack pubkey: %w", err)
+		return fmt.Errorf("pack pubkey: %w", err)
 	}
 
-	rec := &keyring.Record{
-		Name:   name,
+	k.keyID = aws.ToString(pkResp.KeyId)
+	k.pubKey = pubKey
+	k.addr = sdk.AccAddress(pubKey.Address()).String()
+	k.record = &keyring.Record{
+		Name:   k.config.KeyName,
 		PubKey: anyPub,
-		Item: &keyring.Record_Offline_{
-			Offline: &keyring.Record_Offline{},
-		},
+		Item:   &keyring.Record_Offline_{Offline: &keyring.Record_Offline{}},
 	}
 
-	return &kmsCachedRecord{keyID: keyID, rec: rec, pub: pubKey}, nil
+	return nil
 }
 
 func kmsPubKeyToCosmos(derBytes []byte) (cryptotypes.PubKey, error) {
@@ -281,29 +113,13 @@ func kmsPubKeyToCosmos(derBytes []byte) (cryptotypes.PubKey, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	// ToBytes() returns 33-byte compressed format
 	return &secp256k1.PubKey{Key: pub.ToBytes()}, nil
 }
 
-func (k *kmsKeyring) Backend() string {
-	return "kms"
-}
+func (k *kmsKeyring) Backend() string { return "kms" }
 
 func (k *kmsKeyring) List() ([]*keyring.Record, error) {
-	k.mu.RLock()
-	defer k.mu.RUnlock()
-
-	records := make([]*keyring.Record, 0, len(k.records))
-	names := make([]string, 0, len(k.records))
-	for name := range k.records {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		records = append(records, k.records[name].rec)
-	}
-	return records, nil
+	return []*keyring.Record{k.record}, nil
 }
 
 func (k *kmsKeyring) SupportedAlgorithms() (keyring.SigningAlgoList, keyring.SigningAlgoList) {
@@ -312,141 +128,26 @@ func (k *kmsKeyring) SupportedAlgorithms() (keyring.SigningAlgoList, keyring.Sig
 }
 
 func (k *kmsKeyring) Key(uid string) (*keyring.Record, error) {
-	cached, err := k.getRecord(uid)
-	if err != nil {
-		return nil, err
+	if uid != k.config.KeyName {
+		return nil, sdkerrors.ErrKeyNotFound
 	}
-	return cached.rec, nil
+	return k.record, nil
 }
 
 func (k *kmsKeyring) KeyByAddress(address sdk.Address) (*keyring.Record, error) {
-	k.mu.RLock()
-	name, ok := k.addrLookup[address.String()]
-	k.mu.RUnlock()
-	if !ok {
+	if address.String() != k.addr {
 		return nil, sdkerrors.ErrKeyNotFound
 	}
-	return k.Key(name)
-}
-
-func (k *kmsKeyring) getRecord(name string) (*kmsCachedRecord, error) {
-	// Check cache
-	k.mu.RLock()
-	cached, ok := k.records[name]
-	k.mu.RUnlock()
-	if ok {
-		return cached, nil
-	}
-
-	// Refresh cache from KMS
-	if err := k.refreshCache(); err != nil {
-		return nil, err
-	}
-
-	// Check cache again
-	k.mu.RLock()
-	cached, ok = k.records[name]
-	k.mu.RUnlock()
-	if ok {
-		return cached, nil
-	}
-
-	// Auto-create if enabled
-	if k.config.AutoCreate {
-		newRec, err := k.createKeyInKMS(name)
-		if err != nil {
-			return nil, fmt.Errorf("failed to auto-create key %q: %w", name, err)
-		}
-
-		// Cache the newly created key
-		addr := sdk.AccAddress(newRec.pub.Address()).String()
-		k.mu.Lock()
-		k.records[name] = newRec
-		k.addrLookup[addr] = name
-		k.mu.Unlock()
-
-		return newRec, nil
-	}
-
-	return nil, sdkerrors.ErrKeyNotFound
-}
-
-func (k *kmsKeyring) Delete(string) error               { return errUnsupportedKMSOp }
-func (k *kmsKeyring) DeleteByAddress(sdk.Address) error { return errUnsupportedKMSOp }
-func (k *kmsKeyring) Rename(string, string) error       { return errUnsupportedKMSOp }
-
-func (k *kmsKeyring) NewMnemonic(uid string, _ keyring.Language, _, _ string, algo keyring.SignatureAlgo) (*keyring.Record, string, error) {
-	// Validate algorithm
-	if algo != hd.Secp256k1 {
-		return nil, "", fmt.Errorf("kms: only secp256k1 supported, got %s", algo)
-	}
-
-	// Reuse the creation logic
-	cached, err := k.createKeyInKMS(uid)
-	if err != nil {
-		return nil, "", err
-	}
-
-	// Cache the newly created key
-	addr := sdk.AccAddress(cached.pub.Address()).String()
-	k.mu.Lock()
-	k.records[uid] = cached
-	k.addrLookup[addr] = uid
-	k.mu.Unlock()
-
-	// Return empty mnemonic (not applicable for KMS-managed keys)
-	return cached.rec, "", nil
-}
-
-// createKeyInKMS creates a new secp256k1 key in KMS and creates an alias for it
-func (k *kmsKeyring) createKeyInKMS(name string) (*kmsCachedRecord, error) {
-	// Create key in KMS
-	createResp, err := k.client.CreateKey(k.ctx, &kms.CreateKeyInput{
-		KeySpec:     kmstypes.KeySpecEccSecgP256k1,
-		KeyUsage:    kmstypes.KeyUsageTypeSignVerify,
-		Description: aws.String(fmt.Sprintf("Celestia account: %s", name)),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create KMS key: %w", err)
-	}
-
-	keyID := *createResp.KeyMetadata.KeyId
-
-	// Create alias
-	aliasName := k.aliasPrefix + name
-	_, err = k.client.CreateAlias(k.ctx, &kms.CreateAliasInput{
-		AliasName:   aws.String(aliasName),
-		TargetKeyId: aws.String(keyID),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create alias: %w", err)
-	}
-
-	// Build and return the record
-	return k.buildRecord(name, keyID)
-}
-
-func (k *kmsKeyring) NewAccount(string, string, string, string, keyring.SignatureAlgo) (*keyring.Record, error) {
-	return nil, errUnsupportedKMSOp
-}
-func (k *kmsKeyring) SaveLedgerKey(string, keyring.SignatureAlgo, string, uint32, uint32, uint32) (*keyring.Record, error) {
-	return nil, errUnsupportedKMSOp
-}
-func (k *kmsKeyring) SaveOfflineKey(string, cryptotypes.PubKey) (*keyring.Record, error) {
-	return nil, errUnsupportedKMSOp
-}
-func (k *kmsKeyring) SaveMultisig(string, cryptotypes.PubKey) (*keyring.Record, error) {
-	return nil, errUnsupportedKMSOp
+	return k.record, nil
 }
 
 func (k *kmsKeyring) Sign(uid string, msg []byte, _ signing.SignMode) ([]byte, cryptotypes.PubKey, error) {
-	cached, err := k.getRecord(uid)
-	if err != nil {
-		return nil, nil, err
+	if uid != k.config.KeyName {
+		return nil, nil, sdkerrors.ErrKeyNotFound
 	}
 
 	sigResp, err := k.client.Sign(k.ctx, &kms.SignInput{
-		KeyId:            aws.String(cached.keyID),
+		KeyId:            aws.String(k.keyID),
 		Message:          msg,
 		MessageType:      kmstypes.MessageTypeRaw,
 		SigningAlgorithm: kmstypes.SigningAlgorithmSpecEcdsaSha256,
@@ -460,43 +161,32 @@ func (k *kmsKeyring) Sign(uid string, msg []byte, _ signing.SignMode) ([]byte, c
 		return nil, nil, err
 	}
 
-	return signature, cached.pub, nil
+	return signature, k.pubKey, nil
 }
 
 func (k *kmsKeyring) SignByAddress(address sdk.Address, msg []byte, signMode signing.SignMode) ([]byte, cryptotypes.PubKey, error) {
-	k.mu.RLock()
-	name, ok := k.addrLookup[address.String()]
-	k.mu.RUnlock()
-	if !ok {
+	if address.String() != k.addr {
 		return nil, nil, sdkerrors.ErrKeyNotFound
 	}
-	return k.Sign(name, msg, signMode)
+	return k.Sign(k.config.KeyName, msg, signMode)
 }
 
-// derSignatureToSecp converts a DER-encoded ECDSA signature from AWS KMS to raw secp256k1 format (64 bytes: R || S).
-// It uses github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa for robust parsing and automatic low-S normalization.
 func derSignatureToSecp(der []byte) ([]byte, error) {
-	// Parse DER signature using the battle-tested decred library
 	sig, err := secp256k1ecdsa.ParseDERSignature(der)
 	if err != nil {
 		return nil, fmt.Errorf("parse der signature: %w", err)
 	}
 
-	// Extract R and S values
 	r := sig.R()
 	s := sig.S()
 
-	// Normalize S to low-S form (BIP 62) if needed
-	// This is required for Cosmos signature verification
 	if s.IsOverHalfOrder() {
 		s = *new(dcrsecp256k1.ModNScalar).NegateVal(&s)
 	}
 
-	// Convert to 32-byte arrays
 	rBytes := r.Bytes()
 	sBytes := s.Bytes()
 
-	// Concatenate R and S to create the 64-byte signature format expected by Cosmos
 	result := make([]byte, 64)
 	copy(result[:32], rBytes[:])
 	copy(result[32:], sBytes[:])
@@ -504,85 +194,29 @@ func derSignatureToSecp(der []byte) ([]byte, error) {
 	return result, nil
 }
 
-func (k *kmsKeyring) ImportPrivKey(_ string, _ string, _ string) error {
-	return fmt.Errorf("kms: armored import not supported, use ImportPrivKeyHex for hex-encoded keys")
+// Unsupported operations
+func (k *kmsKeyring) Delete(string) error               { return errUnsupportedKMSOp }
+func (k *kmsKeyring) DeleteByAddress(sdk.Address) error { return errUnsupportedKMSOp }
+func (k *kmsKeyring) Rename(string, string) error       { return errUnsupportedKMSOp }
+func (k *kmsKeyring) NewMnemonic(string, keyring.Language, string, string, keyring.SignatureAlgo) (*keyring.Record, string, error) {
+	return nil, "", errUnsupportedKMSOp
 }
-
-func (k *kmsKeyring) ImportPrivKeyHex(uid string, privKeyHex string, algoStr string) error {
-	// Validate algorithm
-	if algoStr != "secp256k1" {
-		return fmt.Errorf("kms: only secp256k1 supported, got %s", algoStr)
-	}
-
-	// Convert hex to PKCS#8 DER
-	keyMaterial, err := hexToPrivateKey(privKeyHex)
-	if err != nil {
-		return fmt.Errorf("convert private key: %w", err)
-	}
-
-	// Step 1: Create KMS key with EXTERNAL origin
-	createResp, err := k.client.CreateKey(k.ctx, &kms.CreateKeyInput{
-		Origin:      kmstypes.OriginTypeExternal,
-		KeySpec:     kmstypes.KeySpecEccSecgP256k1,
-		KeyUsage:    kmstypes.KeyUsageTypeSignVerify,
-		Description: aws.String(fmt.Sprintf("Celestia imported account: %s", uid)),
-	})
-	if err != nil {
-		return fmt.Errorf("kms create key: %w", err)
-	}
-	keyID := aws.ToString(createResp.KeyMetadata.KeyId)
-
-	// Step 2: Get wrapping parameters
-	paramsResp, err := k.client.GetParametersForImport(k.ctx, &kms.GetParametersForImportInput{
-		KeyId:             aws.String(keyID),
-		WrappingAlgorithm: kmstypes.AlgorithmSpecRsaesOaepSha256,
-		WrappingKeySpec:   kmstypes.WrappingKeySpecRsa2048,
-	})
-	if err != nil {
-		return fmt.Errorf("kms get import parameters: %w", err)
-	}
-
-	// Step 3: Wrap key material
-	encryptedMaterial, err := wrapKeyMaterial(keyMaterial, paramsResp.PublicKey)
-	if err != nil {
-		return fmt.Errorf("wrap key material: %w", err)
-	}
-
-	// Step 4: Import key material
-	_, err = k.client.ImportKeyMaterial(k.ctx, &kms.ImportKeyMaterialInput{
-		KeyId:                aws.String(keyID),
-		ImportToken:          paramsResp.ImportToken,
-		EncryptedKeyMaterial: encryptedMaterial,
-		ExpirationModel:      kmstypes.ExpirationModelTypeKeyMaterialDoesNotExpire,
-	})
-	if err != nil {
-		// Clean up the key if import fails
-		_, _ = k.client.ScheduleKeyDeletion(k.ctx, &kms.ScheduleKeyDeletionInput{
-			KeyId:               aws.String(keyID),
-			PendingWindowInDays: aws.Int32(7),
-		})
-		return fmt.Errorf("kms import key material: %w", err)
-	}
-
-	// Step 5: Create alias
-	aliasName := k.aliasPrefix + uid
-	_, err = k.client.CreateAlias(k.ctx, &kms.CreateAliasInput{
-		AliasName:   aws.String(aliasName),
-		TargetKeyId: aws.String(keyID),
-	})
-	if err != nil {
-		return fmt.Errorf("kms create alias: %w", err)
-	}
-
-	// Step 6: Refresh cache
-	if err := k.refreshCache(); err != nil {
-		return err
-	}
-
-	return nil
+func (k *kmsKeyring) NewAccount(string, string, string, string, keyring.SignatureAlgo) (*keyring.Record, error) {
+	return nil, errUnsupportedKMSOp
 }
-func (k *kmsKeyring) ImportPubKey(string, string) error        { return errUnsupportedKMSOp }
-func (k *kmsKeyring) ExportPubKeyArmor(string) (string, error) { return "", errUnsupportedKMSOp }
+func (k *kmsKeyring) SaveLedgerKey(string, keyring.SignatureAlgo, string, uint32, uint32, uint32) (*keyring.Record, error) {
+	return nil, errUnsupportedKMSOp
+}
+func (k *kmsKeyring) SaveOfflineKey(string, cryptotypes.PubKey) (*keyring.Record, error) {
+	return nil, errUnsupportedKMSOp
+}
+func (k *kmsKeyring) SaveMultisig(string, cryptotypes.PubKey) (*keyring.Record, error) {
+	return nil, errUnsupportedKMSOp
+}
+func (k *kmsKeyring) ImportPrivKey(string, string, string) error    { return errUnsupportedKMSOp }
+func (k *kmsKeyring) ImportPrivKeyHex(string, string, string) error { return errUnsupportedKMSOp }
+func (k *kmsKeyring) ImportPubKey(string, string) error             { return errUnsupportedKMSOp }
+func (k *kmsKeyring) ExportPubKeyArmor(string) (string, error)      { return "", errUnsupportedKMSOp }
 func (k *kmsKeyring) ExportPubKeyArmorByAddress(sdk.Address) (string, error) {
 	return "", errUnsupportedKMSOp
 }
